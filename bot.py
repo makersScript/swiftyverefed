@@ -259,6 +259,8 @@ async def fb_delete(path: str):
 # ==================== ШИФРОВАНИЕ ====================
 ENC_KEY = b""
 MAC_KEY = b""
+PHONE_ENABLED = False   # включается в main(), если задан PHONE_ENC_KEY
+PHONE_OFF_TEXT = "📱 Привязка номера сейчас недоступна. Попробуй позже."
 
 def init_crypto():
     """Из мастер-ключа получаем два независимых ключа: для AES-GCM (номера) и для HMAC (коды)."""
@@ -439,14 +441,21 @@ async def h_send_code(fb_uid, uid, req):
         return {"ok": False, "code": "too_many"}
     tg_id = int(dec_str(sec["t"], uid))
     code = f"{secrets.randbelow(100000):05d}"
+    if req.get("purpose") == "reset":
+        title = "🔑 <b>Код восстановления пароля Swifty Chat</b>"
+        tail = ("Этот код нужен, чтобы задать новый пароль. Если вы ничего не запрашивали, "
+                "проигнорируйте сообщение: без кода пароль не сменить.")
+    else:
+        title = "🔐 <b>Код входа в Swifty Chat</b>"
+        tail = "Если вход пытаетесь выполнить не вы, проигнорируйте это сообщение и смените пароль."
     try:
         await bot.send_message(
             tg_id,
-            "🔐 <b>Код входа в Swifty Chat</b>\n\n"
+            f"{title}\n\n"
             f"<code>{code}</code>\n\n"
             f"Аккаунт: <code>{uid}</code>\n"
             "Код действует 5 минут. Никому его не сообщайте, даже сотрудникам Swifty Chat.\n"
-            "Если вход пытаетесь выполнить не вы, проигнорируйте это сообщение и смените пароль.",
+            f"{tail}",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -542,7 +551,22 @@ async def h_confirm_bind(fb_uid, uid, req):
         pass
     return {"ok": True, "code": "rejected"}
 
+async def h_revoke(fb_uid, uid, req):
+    """Завершение сеанса другого устройства: убираем его право входить без кода из Telegram."""
+    if not await _mapped_to(fb_uid, uid):
+        return {"ok": False, "code": "forbidden"}
+    target = req.get("target")
+    if not isinstance(target, str) or not FB_UID_RE.match(target) or target == fb_uid:
+        return {"ok": False, "code": "bad_request"}
+    upd = {f"login_grants/{target}/{uid}": None}
+    if (await fb_get(f"uid_map/{target}")) == uid:
+        upd[f"uid_map/{target}"] = None
+        upd[f"user_sessions/{uid}/{target}"] = None
+    await fb_patch("", upd)
+    return {"ok": True, "code": "revoked"}
+
 REQ_HANDLERS = {
+    "revoke": h_revoke,
     "send_code": h_send_code,
     "verify": h_verify,
     "set_show": h_set_show,
@@ -712,6 +736,9 @@ async def cmd_admin(message: Message, state: FSMContext):
 async def cmd_unbind_admin(message: Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID:
         return
+    if not PHONE_ENABLED:
+        await message.answer("Привязка номера отключена: не задан PHONE_ENC_KEY.")
+        return
     uid = (command.args or "").strip()
     if not is_valid_uid(uid):
         await message.answer("Формат: <code>/unbind user_1234</code>", parse_mode="HTML")
@@ -803,6 +830,9 @@ async def buy_verify(call: CallbackQuery, state: FSMContext):
 # ---------- ПРИВЯЗКА НОМЕРА ----------
 @dp.callback_query(F.data == "bind_phone")
 async def bind_phone(call: CallbackQuery, state: FSMContext):
+    if not PHONE_ENABLED:
+        await call.answer(PHONE_OFF_TEXT, show_alert=True)
+        return
     data = await state.get_data()
     suggest = data.get("suggest_uid")
     await state.set_state(BindStates.waiting_uid)
@@ -869,6 +899,9 @@ async def begin_bind(message: Message, state: FSMContext, uid: str):
 
 @dp.callback_query(F.data.startswith("bind_use:"))
 async def bind_use(call: CallbackQuery, state: FSMContext):
+    if not PHONE_ENABLED:
+        await call.answer(PHONE_OFF_TEXT, show_alert=True)
+        return
     uid = call.data.split(":", 1)[1]
     await call.answer()
     await begin_bind(call.message, state, uid)
@@ -927,6 +960,9 @@ async def bind_contact_other(message: Message, state: FSMContext):
 # ---------- ОТВЯЗКА НОМЕРА ----------
 @dp.callback_query(F.data == "unbind_menu")
 async def unbind_menu(call: CallbackQuery):
+    if not PHONE_ENABLED:
+        await call.answer(PHONE_OFF_TEXT, show_alert=True)
+        return
     try:
         bound = await fb_get(f"phone_by_tg/{call.from_user.id}")
     except Exception as e:
@@ -1169,14 +1205,22 @@ async def pre_checkout_handler(pre_checkout: PreCheckoutQuery):
 
 # ==================== ЗАПУСК ====================
 async def main():
+    global PHONE_ENABLED
     init_db()
-    init_crypto()
-    worker = asyncio.create_task(phone_worker())
+    worker = None
+    try:
+        init_crypto()
+        PHONE_ENABLED = True
+        worker = asyncio.create_task(phone_worker())
+    except RuntimeError as e:
+        # Без ключа бот всё равно запускается: покупки работают, привязка номера отключена.
+        logging.error(f"Привязка номера ОТКЛЮЧЕНА: {e}")
     logging.info("Swifty Verify bot started!")
     try:
         await dp.start_polling(bot, skip_updates=True)
     finally:
-        worker.cancel()
+        if worker is not None:
+            worker.cancel()
         if _http_session is not None and not _http_session.closed:
             await _http_session.close()
 
