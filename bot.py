@@ -51,6 +51,22 @@ PENDING_TTL = 600              # заявка на привязку ждёт п�
 GRANT_TTL_MS = 365 * 24 * 3600 * 1000   # «доверенное устройство» после входа по коду
 REQ_MAX_AGE_MS = 120_000       # запросы старше 2 минут игнорируем
 
+# ---- Swifty Money / подарки / маркет ----
+# Пакеты пополнения: сколько Swifty Money -> сколько Telegram Stars.
+# При старте бот сам публикует их в Firebase (money_packs), приложение читает оттуда.
+MONEY_PACKS = {100: 25, 500: 110, 1000: 210, 5000: 950}
+MARKET_FEE_PERCENT = 0         # комиссия маркета (в % с цены лота), 0 = без комиссии
+MIN_GIFT_LIST_PRICE = 1        # минимальная цена подарка на маркете
+MIN_USERNAME_PRICE = 100       # минимальная цена юзернейма на маркете
+MAX_PRICE = 10_000_000         # максимальная цена лота
+MAX_NFT_USERNAMES = 30         # сколько NFT-юзернеймов может держать один пользователь
+SHOP_POLL_SEC = float(os.getenv("SHOP_POLL_SEC", "1.0"))   # как часто бот проверяет запросы магазина из приложения
+FAV_NAME = "⭐ Избранное"
+SERVER_TS = {".sv": "timestamp"}
+NFT_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+GID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+IID_RE = re.compile(r"^[A-Za-z0-9_-]{1,60}$")
+
 FB_UID_RE = re.compile(r"^[A-Za-z0-9]{20,40}$")
 RID_RE = re.compile(r"^[A-Za-z0-9]{4,64}$")
 
@@ -91,6 +107,16 @@ def init_db():
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_code_log ON code_log (uid, kind, ts)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS money_payments (
+            charge_id TEXT PRIMARY KEY,
+            tg_id INTEGER,
+            uid TEXT,
+            amount INTEGER,
+            stars INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s','now'))
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -135,6 +161,9 @@ class AdminStates(StatesGroup):
 class BindStates(StatesGroup):
     waiting_uid = State()
     waiting_contact = State()
+
+class MoneyStates(StatesGroup):
+    waiting_uid = State()
 
 # ==================== ВАЛИДАЦИЯ UID ====================
 def is_valid_uid(uid: str) -> bool:
@@ -672,9 +701,414 @@ async def check_invoice(invoice_id: str) -> str:
         logging.error(f"check_invoice error: {e}")
     return "unknown"
 
+# ==================== SWIFTY MONEY: КОШЕЛЁК, МАГАЗИН, МАРКЕТ ====================
+import json as _json
+
+_PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+_last_push_time = 0
+_last_rand = [0] * 12
+
+def fb_push_id() -> str:
+    """Ключ как у push() в Firebase SDK (по возрастанию времени) — чтобы сообщения от бота шли в чате по порядку."""
+    global _last_push_time, _last_rand
+    now = int(time.time() * 1000)
+    dup = (now == _last_push_time)
+    _last_push_time = now
+    ts_chars = [""] * 8
+    t = now
+    for i in range(7, -1, -1):
+        ts_chars[i] = _PUSH_CHARS[t % 64]
+        t //= 64
+    pid = "".join(ts_chars)
+    if not dup:
+        _last_rand = [secrets.randbelow(64) for _ in range(12)]
+    else:
+        i = 11
+        while i >= 0 and _last_rand[i] == 63:
+            _last_rand[i] = 0
+            i -= 1
+        if i >= 0:
+            _last_rand[i] += 1
+    return pid + "".join(_PUSH_CHARS[c] for c in _last_rand)
+
+async def fb_get_query(path: str, order_by: str, equal_to):
+    """GET с orderBy/equalTo (для узлов с .indexOn в правилах)."""
+    token = await get_firebase_token()
+    url = f"{FIREBASE_DATABASE_URL}/{path}.json"
+    params = {"orderBy": _json.dumps(order_by), "equalTo": _json.dumps(equal_to)}
+    async with get_session().get(url, params=params, headers={"Authorization": f"Bearer {token}"},
+                                 timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        if resp.status >= 400:
+            raise RuntimeError(f"Firebase query /{path}: {resp.status} {(await resp.text())[:200]}")
+        return await resp.json()
+
+money_lock = asyncio.Lock()   # все операции с балансом идут строго по одной
+
+def _int(v, default=0) -> int:
+    try:
+        if isinstance(v, bool):
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+async def get_balance(uid: str) -> int:
+    return _int(await fb_get(f"wallets/{uid}/balance"))
+
+def log_entry(kind: str, amount: int, desc: str) -> dict:
+    return {"k": kind, "a": amount, "d": desc, "ts": SERVER_TS}
+
+async def credit_money(uid: str, amount: int, kind: str, desc: str) -> int:
+    """Начислить (или списать, если amount < 0) Swifty Money. Возвращает новый баланс."""
+    async with money_lock:
+        bal = await get_balance(uid)
+        new_bal = max(0, bal + amount)
+        await fb_patch("", {
+            f"wallets/{uid}/balance": new_bal,
+            f"wallet_log/{uid}/{fb_push_id()}": log_entry(kind, new_bal - bal, desc),
+        })
+        return new_bal
+
+async def user_nick(uid: str) -> str:
+    v = await fb_get(f"users/{uid}")
+    return v if isinstance(v, str) and v else uid
+
+def priv_room(a: str, b: str) -> str:
+    """Тот же id личного чата, что строит приложение."""
+    return f"priv_{a}_{b}" if a < b else f"priv_{b}_{a}"
+
+def gift_message(kind: str, uid: str, sender_nick: str, iid: str, gid: str, serial: int, price: int) -> dict:
+    return {"type": "gift", "kind": kind, "sender": sender_nick, "uid": uid, "iid": iid,
+            "gid": gid, "n": serial, "price": price, "timestamp": SERVER_TS}
+
+async def is_banned(uid: str) -> bool:
+    v = await fb_get(f"banned_users/{uid}")
+    return v is not None and v is not False
+
+def _price_arg(req, lo: int):
+    p = req.get("price")
+    if isinstance(p, bool) or not isinstance(p, (int, float)) or int(p) != p:
+        return None
+    p = int(p)
+    return p if lo <= p <= MAX_PRICE else None
+
+def _net(price: int) -> int:
+    return price - (price * MARKET_FEE_PERCENT) // 100
+
+# ---------- подарки ----------
+async def h_buy_gift(fb_uid, uid, req):
+    gid = req.get("gid")
+    if not isinstance(gid, str) or not GID_RE.match(gid):
+        return {"ok": False, "code": "bad_request"}
+    gt = await fb_get(f"gift_types/{gid}")
+    if not isinstance(gt, dict) or gt.get("active") is False:
+        return {"ok": False, "code": "no_gift"}
+    price = _int(gt.get("price"))
+    supply = _int(gt.get("supply"))
+    if price < 1:
+        return {"ok": False, "code": "no_gift"}
+    async with money_lock:
+        minted = _int(await fb_get(f"gift_minted/{gid}"))
+        if supply > 0 and minted >= supply:
+            return {"ok": False, "code": "sold_out"}
+        bal = await get_balance(uid)
+        if bal < price:
+            return {"ok": False, "code": "no_money", "need": price - bal, "balance": bal}
+        serial = minted + 1
+        iid = f"{gid}_{serial}"
+        nick = await user_nick(uid)
+        fav = priv_room(uid, uid)
+        name = str(gt.get("name", "подарок"))[:40]
+        await fb_patch("", {
+            f"wallets/{uid}/balance": bal - price,
+            f"gift_minted/{gid}": serial,
+            f"gifts/{iid}": {"t": gid, "n": serial, "owner": uid, "from": uid, "ts": SERVER_TS,
+                             "shown": False, "pin": 0, "price": 0},
+            f"wallet_log/{uid}/{fb_push_id()}": log_entry("buy", -price, f"Подарок «{name}» #{serial}"),
+            f"rooms/{fav}/messages/{fb_push_id()}": gift_message("saved", uid, nick, iid, gid, serial, price),
+            f"user_chats/{uid}/{fav}": FAV_NAME,
+        })
+    return {"ok": True, "code": "bought", "iid": iid, "balance": bal - price}
+
+async def _resolve_target(raw: str):
+    raw = (raw or "").strip()
+    if is_valid_uid(raw):
+        return raw if await check_user_exists(raw) else None
+    name = raw.lstrip("@").lower()
+    if not re.fullmatch(r"[a-z0-9_]{1,32}", name):
+        return None
+    tuid = await fb_get(f"user_usernames/{name}")
+    if isinstance(tuid, str) and await check_user_exists(tuid):
+        return tuid
+    return None
+
+async def h_send_gift(fb_uid, uid, req):
+    iid = req.get("iid")
+    if not isinstance(iid, str) or not IID_RE.match(iid):
+        return {"ok": False, "code": "bad_request"}
+    tuid = await _resolve_target(str(req.get("to", "")))
+    if not tuid:
+        return {"ok": False, "code": "no_user"}
+    if tuid == uid:
+        return {"ok": False, "code": "self"}
+    async with money_lock:
+        g = await fb_get(f"gifts/{iid}")
+        if not isinstance(g, dict) or g.get("owner") != uid:
+            return {"ok": False, "code": "not_owner"}
+        room = priv_room(uid, tuid)
+        snick, tnick = await user_nick(uid), await user_nick(tuid)
+        await fb_patch("", {
+            f"gifts/{iid}/owner": tuid, f"gifts/{iid}/from": uid, f"gifts/{iid}/shown": False,
+            f"gifts/{iid}/pin": 0, f"gifts/{iid}/price": 0,
+            f"rooms/{room}/messages/{fb_push_id()}": gift_message("sent", uid, snick, iid, g.get("t", ""), _int(g.get("n")), 0),
+            f"user_chats/{uid}/{room}": tnick,
+            f"user_chats/{tuid}/{room}": snick,
+        })
+    return {"ok": True, "code": "sent", "room": room, "to": tuid, "nick": tnick}
+
+async def h_list_gift(fb_uid, uid, req):
+    iid = req.get("iid")
+    price = _price_arg(req, MIN_GIFT_LIST_PRICE)
+    if not isinstance(iid, str) or not IID_RE.match(iid) or price is None:
+        return {"ok": False, "code": "bad_request"}
+    async with money_lock:
+        g = await fb_get(f"gifts/{iid}")
+        if not isinstance(g, dict) or g.get("owner") != uid:
+            return {"ok": False, "code": "not_owner"}
+        await fb_patch("", {f"gifts/{iid}/price": price, f"gifts/{iid}/pin": 0, f"gifts/{iid}/lts": SERVER_TS})
+    return {"ok": True, "code": "listed"}
+
+async def h_unlist_gift(fb_uid, uid, req):
+    iid = req.get("iid")
+    if not isinstance(iid, str) or not IID_RE.match(iid):
+        return {"ok": False, "code": "bad_request"}
+    async with money_lock:
+        g = await fb_get(f"gifts/{iid}")
+        if not isinstance(g, dict) or g.get("owner") != uid:
+            return {"ok": False, "code": "not_owner"}
+        await fb_patch("", {f"gifts/{iid}/price": 0})
+    return {"ok": True, "code": "unlisted"}
+
+async def h_buy_market_gift(fb_uid, uid, req):
+    iid = req.get("iid")
+    if not isinstance(iid, str) or not IID_RE.match(iid):
+        return {"ok": False, "code": "bad_request"}
+    async with money_lock:
+        g = await fb_get(f"gifts/{iid}")
+        if not isinstance(g, dict):
+            return {"ok": False, "code": "not_listed"}
+        price = _int(g.get("price"))
+        seller = g.get("owner")
+        if price < 1 or not isinstance(seller, str):
+            return {"ok": False, "code": "not_listed"}
+        # цену, которую видел покупатель, сверяем с текущей (продавец мог её поменять)
+        if "price" in req and _int(req.get("price")) != price:
+            return {"ok": False, "code": "price_changed", "price": price}
+        if seller == uid:
+            return {"ok": False, "code": "own"}
+        bal = await get_balance(uid)
+        if bal < price:
+            return {"ok": False, "code": "no_money", "need": price - bal, "balance": bal}
+        sbal = await get_balance(seller)
+        gt = await fb_get(f"gift_types/{g.get('t')}") or {}
+        name = str(gt.get("name", "подарок"))[:40]
+        serial = _int(g.get("n"))
+        nick = await user_nick(uid)
+        fav = priv_room(uid, uid)
+        await fb_patch("", {
+            f"wallets/{uid}/balance": bal - price,
+            f"wallets/{seller}/balance": sbal + _net(price),
+            f"gifts/{iid}/owner": uid, f"gifts/{iid}/from": seller, f"gifts/{iid}/shown": False,
+            f"gifts/{iid}/pin": 0, f"gifts/{iid}/price": 0,
+            f"wallet_log/{uid}/{fb_push_id()}": log_entry("market_buy", -price, f"Маркет: «{name}» #{serial}"),
+            f"wallet_log/{seller}/{fb_push_id()}": log_entry("market_sell", _net(price), f"Продан «{name}» #{serial}"),
+            f"rooms/{fav}/messages/{fb_push_id()}": gift_message("saved", uid, nick, iid, g.get("t", ""), serial, price),
+            f"user_chats/{uid}/{fav}": FAV_NAME,
+        })
+    return {"ok": True, "code": "bought", "iid": iid, "balance": bal - price}
+
+# ---------- NFT-юзернеймы ----------
+async def username_blocker(name: str, uid: str):
+    """None — имя свободно. Иначе чем занято. Собственный текущий @юзернейм можно превратить в NFT."""
+    for path, who in (("channel_usernames", "channel"), ("room_usernames", "room"),
+                      ("user_usernames", "user"), ("usernames", "nick"), ("nft_usernames", "nft")):
+        v = await fb_get(f"{path}/{name}")
+        if v is not None:
+            if path == "user_usernames" and v == uid:
+                continue
+            return who
+    return None
+
+async def h_list_username(fb_uid, uid, req):
+    name = str(req.get("name", "")).strip().lstrip("@").lower()
+    price = _price_arg(req, MIN_USERNAME_PRICE)
+    if not NFT_NAME_RE.match(name):
+        return {"ok": False, "code": "bad_name"}
+    if price is None:
+        return {"ok": False, "code": "bad_price", "min": MIN_USERNAME_PRICE}
+    async with money_lock:
+        rec = await fb_get(f"nft_usernames/{name}")
+        if isinstance(rec, dict):
+            if rec.get("owner") != uid:
+                return {"ok": False, "code": "taken", "by": "nft"}
+            await fb_patch("", {f"nft_usernames/{name}/price": price, f"nft_usernames/{name}/ts": SERVER_TS})
+            return {"ok": True, "code": "listed"}
+        blocker = await username_blocker(name, uid)
+        if blocker:
+            return {"ok": False, "code": "taken", "by": blocker}
+        owned = await fb_get_query("nft_usernames", "owner", uid)
+        if isinstance(owned, dict) and len(owned) >= MAX_NFT_USERNAMES:
+            return {"ok": False, "code": "limit", "max": MAX_NFT_USERNAMES}
+        upd = {f"nft_usernames/{name}": {"owner": uid, "price": price, "ts": SERVER_TS, "added": False}}
+        if (await fb_get(f"user_usernames/{name}")) == uid:      # это был его обычный @юзернейм
+            upd[f"user_usernames/{name}"] = None
+            if (await fb_get(f"user_username_by_uid/{uid}")) == name:
+                upd[f"user_username_by_uid/{uid}"] = None
+        await fb_patch("", upd)
+    return {"ok": True, "code": "listed"}
+
+async def h_unlist_username(fb_uid, uid, req):
+    name = str(req.get("name", "")).strip().lstrip("@").lower()
+    if not NFT_NAME_RE.match(name):
+        return {"ok": False, "code": "bad_name"}
+    async with money_lock:
+        rec = await fb_get(f"nft_usernames/{name}")
+        if not isinstance(rec, dict) or rec.get("owner") != uid:
+            return {"ok": False, "code": "not_owner"}
+        await fb_patch("", {f"nft_usernames/{name}/price": 0})
+    return {"ok": True, "code": "unlisted"}
+
+async def h_release_username(fb_uid, uid, req):
+    """Отказаться от NFT-юзернейма: имя освобождается для всех."""
+    name = str(req.get("name", "")).strip().lstrip("@").lower()
+    if not NFT_NAME_RE.match(name):
+        return {"ok": False, "code": "bad_name"}
+    async with money_lock:
+        rec = await fb_get(f"nft_usernames/{name}")
+        if not isinstance(rec, dict) or rec.get("owner") != uid:
+            return {"ok": False, "code": "not_owner"}
+        upd = {f"nft_usernames/{name}": None}
+        if (await fb_get(f"user_usernames/{name}")) == uid:
+            upd[f"user_usernames/{name}"] = None
+        await fb_patch("", upd)
+    return {"ok": True, "code": "released"}
+
+async def h_buy_username(fb_uid, uid, req):
+    name = str(req.get("name", "")).strip().lstrip("@").lower()
+    if not NFT_NAME_RE.match(name):
+        return {"ok": False, "code": "bad_name"}
+    async with money_lock:
+        rec = await fb_get(f"nft_usernames/{name}")
+        if not isinstance(rec, dict) or _int(rec.get("price")) < 1:
+            return {"ok": False, "code": "not_listed"}
+        price, seller = _int(rec.get("price")), rec.get("owner")
+        if "price" in req and _int(req.get("price")) != price:
+            return {"ok": False, "code": "price_changed", "price": price}
+        if seller == uid:
+            return {"ok": False, "code": "own"}
+        owned = await fb_get_query("nft_usernames", "owner", uid)
+        if isinstance(owned, dict) and len(owned) >= MAX_NFT_USERNAMES:
+            return {"ok": False, "code": "limit", "max": MAX_NFT_USERNAMES}
+        bal = await get_balance(uid)
+        if bal < price:
+            return {"ok": False, "code": "no_money", "need": price - bal, "balance": bal}
+        sbal = await get_balance(seller)
+        upd = {
+            f"wallets/{uid}/balance": bal - price,
+            f"wallets/{seller}/balance": sbal + _net(price),
+            f"nft_usernames/{name}": {"owner": uid, "price": 0, "ts": SERVER_TS, "added": False},
+            f"wallet_log/{uid}/{fb_push_id()}": log_entry("market_buy", -price, f"Юзернейм @{name}"),
+            f"wallet_log/{seller}/{fb_push_id()}": log_entry("market_sell", _net(price), f"Продан @{name}"),
+        }
+        if (await fb_get(f"user_usernames/{name}")) == seller:    # продавец показывал его как дополнительный
+            upd[f"user_usernames/{name}"] = None
+        await fb_patch("", upd)
+    return {"ok": True, "code": "bought", "balance": bal - price}
+
+# ---------- админ-панель приложения: выдать Swifty Money ----------
+async def h_admin_grant(fb_uid, uid, req):
+    if (await fb_get(f"admins/{uid}")) in (None, False):      # только админы приложения (узел admins)
+        return {"ok": False, "code": "forbidden"}
+    to = req.get("to")
+    amount = req.get("amount")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)) or int(amount) != amount \
+            or not (1 <= int(amount) <= 100_000_000):
+        return {"ok": False, "code": "bad_amount"}
+    if not isinstance(to, str) or not is_valid_uid(to) or not await check_user_exists(to):
+        return {"ok": False, "code": "no_user"}
+    amount = int(amount)
+    new_bal = await credit_money(to, amount, "grant", "Выдано администратором")
+    logging.info(f"admin {uid} granted {amount} Swifty Money to {to}")
+    return {"ok": True, "code": "granted", "balance": new_bal, "nick": await user_nick(to)}
+
+SHOP_HANDLERS = {
+    "admin_grant": h_admin_grant,
+    "buy_gift": h_buy_gift, "send_gift": h_send_gift,
+    "list_gift": h_list_gift, "unlist_gift": h_unlist_gift, "buy_market_gift": h_buy_market_gift,
+    "list_username": h_list_username, "unlist_username": h_unlist_username,
+    "release_username": h_release_username, "buy_username": h_buy_username,
+}
+_shop_processed = {}
+
+async def process_shop_request(fb_uid, req):
+    if not isinstance(fb_uid, str) or not FB_UID_RE.match(fb_uid):
+        return
+    if not isinstance(req, dict):
+        await fb_delete(f"shop_req/{fb_uid}")
+        return
+    rid, typ, uid = req.get("rid"), req.get("type"), req.get("uid")
+    if not isinstance(rid, str) or not RID_RE.match(rid):
+        await fb_delete(f"shop_req/{fb_uid}")
+        return
+    key = f"{fb_uid}:{rid}"
+    if key in _shop_processed:
+        return
+    now_ms = int(time.time() * 1000)
+    _shop_processed[key] = now_ms
+    if len(_shop_processed) > 5000:
+        for k in sorted(_shop_processed, key=_shop_processed.get)[:2500]:
+            _shop_processed.pop(k, None)
+    ts = req.get("ts")
+    if typ not in SHOP_HANDLERS or not isinstance(uid, str) or not is_valid_uid(uid):
+        result = {"ok": False, "code": "bad_request"}
+    elif not isinstance(ts, (int, float)) or abs(now_ms - ts) > REQ_MAX_AGE_MS:
+        result = {"ok": False, "code": "stale"}
+    else:
+        try:
+            if not await _mapped_to(fb_uid, uid):
+                result = {"ok": False, "code": "forbidden"}
+            elif await is_banned(uid):
+                result = {"ok": False, "code": "banned"}
+            else:
+                result = await SHOP_HANDLERS[typ](fb_uid, uid, req)
+        except Exception as e:
+            logging.error(f"shop request {typ} failed: {e}")
+            result = {"ok": False, "code": "server_error"}
+    result["rid"] = rid
+    result["ts"] = now_ms
+    await fb_put(f"shop_resp/{fb_uid}", result)
+    await fb_delete(f"shop_req/{fb_uid}")
+
+async def shop_worker():
+    """Забирает запросы магазина/маркета из shop_req и отвечает в shop_resp."""
+    while True:
+        try:
+            reqs = await fb_get("shop_req")
+            if isinstance(reqs, dict):
+                for fb_uid, req in list(reqs.items()):
+                    await process_shop_request(fb_uid, req)
+        except Exception as e:
+            logging.error(f"shop_worker error: {e}")
+            await asyncio.sleep(5)
+        await asyncio.sleep(SHOP_POLL_SEC)
+
+async def publish_money_packs():
+    await fb_put("money_packs", {f"p{a}": {"amount": a, "stars": s} for a, s in MONEY_PACKS.items()})
+
 # ==================== КЛАВИАТУРЫ ====================
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Купить Swifty Money", callback_data="buy_money")],
         [InlineKeyboardButton(text="✅ Купить подписку", callback_data="buy_verify")],
         [InlineKeyboardButton(text="📱 Привязать номер", callback_data="bind_phone")],
         [InlineKeyboardButton(text="🔓 Отвязать номер", callback_data="unbind_menu")],
@@ -710,8 +1144,29 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
     if args.startswith("bind_") and is_valid_uid(args[5:]):
         await state.update_data(suggest_uid=args[5:])
         hint = "\n\n📱 Чтобы привязать номер, нажми <b>«Привязать номер»</b>."
+    mm = re.fullmatch(r"money_(user_\d{4,})(?:_(\d+))?", args)
+    if mm:
+        m_uid, m_amount = mm.group(1), mm.group(2)
+        await state.update_data(suggest_money_uid=m_uid)
+        await message.answer("👋 Покупка <b>Swifty Money</b> для аккаунта "
+                             f"<code>{m_uid}</code>", parse_mode="HTML")
+        if await money_check_uid(message, m_uid):
+            if m_amount and int(m_amount) in MONEY_PACKS:
+                amount = int(m_amount)
+                await bot.send_invoice(
+                    chat_id=message.from_user.id,
+                    title=f"💎 {amount} Swifty Money",
+                    description=f"Пополнение баланса аккаунта {m_uid} в Swifty Chat",
+                    payload=f"money:{message.from_user.id}:{m_uid}:{amount}",
+                    currency="XTR",
+                    prices=[LabeledPrice(label=f"{amount} Swifty Money", amount=MONEY_PACKS[amount])],
+                )
+            else:
+                await send_money_packs(message, m_uid)
+        return
     await message.answer(
         "👋 Добро пожаловать в <b>Swifty Chat Verify</b>!\n\n"
+        "💎 Купи <b>Swifty Money</b> за Telegram Stars — на них покупаются подарки в магазине.\n"
         "✅ Купи подписку (галочку) для своего аккаунта в <b>Swifty Chat</b>.\n"
         "📱 Или привяжи номер телефона: вход в аккаунт будет защищён кодом из Telegram.\n\n"
         "💰 Подписка: <b>1 USDT</b>\n"
@@ -799,6 +1254,7 @@ async def show_about(call: CallbackQuery):
         "ℹ️ <b>О боте</b>\n\n"
         "Этот бот выдаёт верификацию (галочку ✅) для аккаунта в <b>Swifty Chat</b>.\n"
         "После оплаты галочка появится в профиле автоматически.\n\n"
+        "💎 Здесь же покупается <b>Swifty Money</b> (оплата Telegram Stars) — валюта для магазина подарков и маркета.\n\n"
         "📱 Ещё здесь можно привязать номер телефона. После этого при входе в аккаунт "
         "бот присылает 5-значный код, и даже с украденным паролем в аккаунт не войти.\n\n"
         "💰 Подписка: <b>1 USDT</b>\n"
@@ -1020,6 +1476,9 @@ async def unbind_do(call: CallbackQuery):
 @dp.message(F.successful_payment)
 async def successful_payment_handler(message: Message):
     payload = message.successful_payment.invoice_payload
+    if payload.startswith("money:"):
+        await handle_money_payment(message)
+        return
     # payload формат: stars:user_id:uid
     parts = payload.split(":")
     if len(parts) != 3 or parts[0] != "stars":
@@ -1046,6 +1505,163 @@ async def successful_payment_handler(message: Message):
             "✅ Оплата Stars прошла, но ошибка при выдаче галочки.\n"
             "Напиши администратору — выдадут вручную."
         )
+
+# ==================== SWIFTY MONEY: ПОКУПКА ЗА TELEGRAM STARS ====================
+def money_packs_kb(uid: str):
+    rows = []
+    for amount, stars in sorted(MONEY_PACKS.items()):
+        rows.append([InlineKeyboardButton(text=f"💎 {amount:,} Swifty Money — {stars} ⭐".replace(",", " "),
+                                          callback_data=f"money_pack:{uid}:{amount}")])
+    rows.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def send_money_packs(message: Message, uid: str):
+    bal = await get_balance(uid)
+    await message.answer(
+        f"💎 <b>Swifty Money</b>\n\n"
+        f"👤 Аккаунт: <code>{uid}</code>\n"
+        f"💰 Баланс: <b>{bal}</b>\n\n"
+        f"Выбери, сколько Swifty Money купить. Оплата — Telegram Stars, "
+        f"деньги придут на аккаунт сразу после оплаты.",
+        reply_markup=money_packs_kb(uid), parse_mode="HTML"
+    )
+
+async def money_check_uid(message: Message, uid: str) -> bool:
+    if not is_valid_uid(uid):
+        await message.answer("❌ Неверный формат!\n\nID должен быть в формате <code>user_1234</code>", parse_mode="HTML")
+        return False
+    await message.answer("⏳ Проверяю пользователя в Swifty Chat...")
+    if not await check_user_exists(uid):
+        await message.answer(f"❌ Пользователь <code>{uid}</code> не найден в Swifty Chat.\n\nПроверь ID и попробуй снова.",
+                             parse_mode="HTML")
+        return False
+    return True
+
+@dp.callback_query(F.data == "buy_money")
+async def buy_money(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    suggest = data.get("suggest_money_uid")
+    await state.set_state(MoneyStates.waiting_uid)
+    rows = []
+    if suggest:
+        rows.append([InlineKeyboardButton(text=f"✅ Это мой ID: {suggest}", callback_data=f"money_use:{suggest}")])
+    rows.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="back_main")])
+    await call.message.edit_text(
+        "💎 <b>Купить Swifty Money</b>\n\n"
+        "Введи свой ID из <b>Swifty Chat</b>.\n"
+        "Формат: <code>user_1234</code>\n\n"
+        "ID виден в приложении: Настройки → профиль.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data.startswith("money_use:"))
+async def money_use(call: CallbackQuery, state: FSMContext):
+    uid = call.data.split(":", 1)[1]
+    await call.answer()
+    await state.clear()
+    if await money_check_uid(call.message, uid):
+        await send_money_packs(call.message, uid)
+
+@dp.callback_query(F.data.startswith("money_pack:"))
+async def money_pack(call: CallbackQuery):
+    try:
+        _, uid, amount_s = call.data.split(":")
+        amount = int(amount_s)
+    except Exception:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    stars = MONEY_PACKS.get(amount)
+    if stars is None or not is_valid_uid(uid):
+        await call.answer("Этот пакет недоступен", show_alert=True)
+        return
+    if not await check_user_exists(uid):
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+    await call.answer()
+    await bot.send_invoice(
+        chat_id=call.from_user.id,
+        title=f"💎 {amount} Swifty Money",
+        description=f"Пополнение баланса аккаунта {uid} в Swifty Chat",
+        payload=f"money:{call.from_user.id}:{uid}:{amount}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{amount} Swifty Money", amount=stars)],
+    )
+
+async def handle_money_payment(message: Message):
+    """Успешная оплата Stars за Swifty Money. Каждый платёж зачисляется ровно один раз."""
+    sp = message.successful_payment
+    parts = sp.invoice_payload.split(":")
+    if len(parts) != 4 or parts[0] != "money":
+        return
+    _, tg_id, uid, amount_s = parts
+    try:
+        amount = int(amount_s)
+    except ValueError:
+        return
+    if MONEY_PACKS.get(amount) != sp.total_amount or not is_valid_uid(uid):
+        await message.answer("❌ Платёж не распознан. Напиши администратору, укажи ID платежа:\n"
+                             f"<code>{sp.telegram_payment_charge_id}</code>", parse_mode="HTML")
+        logging.error(f"money payment mismatch: {sp.invoice_payload} total={sp.total_amount}")
+        return
+    charge = sp.telegram_payment_charge_id
+    try:
+        _sql("INSERT INTO money_payments (charge_id, tg_id, uid, amount, stars) VALUES (?, ?, ?, ?, ?)",
+             (charge, int(tg_id), uid, amount, sp.total_amount), commit=True)
+    except sqlite3.IntegrityError:
+        return   # уже зачислено
+    try:
+        new_bal = await credit_money(uid, amount, "topup", f"Пополнение за {sp.total_amount} ⭐")
+    except Exception as e:
+        logging.error(f"money credit failed for {uid} charge={charge}: {e}")
+        await message.answer("✅ Оплата прошла, но зачислить Swifty Money не удалось.\n"
+                             f"Напиши администратору, укажи ID платежа: <code>{charge}</code>", parse_mode="HTML")
+        try:
+            await bot.send_message(ADMIN_ID, f"⚠️ Не зачислено {amount} Swifty Money → {uid}\ncharge: {charge}")
+        except Exception:
+            pass
+        return
+    await message.answer(
+        f"🎉 <b>Оплата прошла!</b>\n\n"
+        f"⭐ Списано: <b>{sp.total_amount} Stars</b>\n"
+        f"💎 Зачислено: <b>{amount} Swifty Money</b>\n"
+        f"💰 Баланс аккаунта <code>{uid}</code>: <b>{new_bal}</b>\n\n"
+        f"Открой Swifty Chat → Магазин подарков 🎁",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Купить ещё", callback_data="buy_money")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
+
+# ---------- админ: ручная выдача / баланс ----------
+@dp.message(Command("addmoney"))
+async def cmd_addmoney(message: Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 2 or not is_valid_uid(parts[0]) or not re.fullmatch(r"-?\d{1,9}", parts[1]):
+        await message.answer("Формат: <code>/addmoney user_1234 500</code> (отрицательное число — списать)", parse_mode="HTML")
+        return
+    uid, amount = parts[0], int(parts[1])
+    if not await check_user_exists(uid):
+        await message.answer(f"❌ Пользователь <code>{uid}</code> не найден.", parse_mode="HTML")
+        return
+    try:
+        new_bal = await credit_money(uid, amount, "grant", "Выдано администратором")
+        await message.answer(f"✅ <code>{uid}</code>: {amount:+d} → баланс <b>{new_bal}</b>", parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"addmoney error: {e}")
+        await message.answer("❌ Ошибка записи в Firebase. Проверь логи.")
+
+@dp.message(Command("balance"))
+async def cmd_balance(message: Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID:
+        return
+    uid = (command.args or "").strip()
+    if not is_valid_uid(uid):
+        await message.answer("Формат: <code>/balance user_1234</code>", parse_mode="HTML")
+        return
+    await message.answer(f"💰 <code>{uid}</code>: <b>{await get_balance(uid)}</b> Swifty Money", parse_mode="HTML")
 
 # ---------- ОБЩИЙ ОБРАБОТЧИК (ID для покупки / выдача админом) ----------
 @dp.message()
@@ -1082,6 +1698,14 @@ async def handle_message(message: Message, state: FSMContext):
             )
         else:
             await message.answer("❌ Ошибка записи в Firebase. Проверь логи.")
+        return
+
+    # Пользователь вводит UID для покупки Swifty Money
+    if current_state == MoneyStates.waiting_uid:
+        uid = text
+        if await money_check_uid(message, uid):
+            await state.clear()
+            await send_money_packs(message, uid)
         return
 
     # Пользователь вводит UID для покупки
@@ -1208,6 +1832,7 @@ async def main():
     global PHONE_ENABLED
     init_db()
     worker = None
+    shop_task = None
     try:
         init_crypto()
         PHONE_ENABLED = True
@@ -1215,12 +1840,19 @@ async def main():
     except RuntimeError as e:
         # Без ключа бот всё равно запускается: покупки работают, привязка номера отключена.
         logging.error(f"Привязка номера ОТКЛЮЧЕНА: {e}")
+    try:
+        await publish_money_packs()
+    except Exception as e:
+        logging.error(f"Не удалось опубликовать money_packs: {e}")
+    shop_task = asyncio.create_task(shop_worker())
     logging.info("Swifty Verify bot started!")
     try:
         await dp.start_polling(bot, skip_updates=True)
     finally:
         if worker is not None:
             worker.cancel()
+        if shop_task is not None:
+            shop_task.cancel()
         if _http_session is not None and not _http_session.closed:
             await _http_session.close()
 
