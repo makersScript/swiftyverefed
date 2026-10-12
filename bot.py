@@ -822,6 +822,7 @@ async def h_buy_gift(fb_uid, uid, req):
         await fb_patch("", {
             f"wallets/{uid}/balance": bal - price,
             f"gift_minted/{gid}": serial,
+            f"stats_gift_buyers/{uid}": SERVER_TS,
             f"gifts/{iid}": {"t": gid, "n": serial, "owner": uid, "from": uid, "ts": SERVER_TS,
                              "shown": False, "pin": 0, "price": 0},
             f"wallet_log/{uid}/{fb_push_id()}": log_entry("buy", -price, f"Подарок «{name}» #{serial}"),
@@ -1119,6 +1120,8 @@ def main_menu_kb():
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="⭐ Звёзды и продажи", callback_data="admin_sales")],
+        [InlineKeyboardButton(text="💸 Как вывести звёзды", callback_data="admin_withdraw")],
         [InlineKeyboardButton(text="🎁 Выдать галочку бесплатно", callback_data="admin_free_verify")],
     ])
 
@@ -1236,6 +1239,119 @@ async def admin_back(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
     await call.message.edit_text("👑 <b>Админ панель</b>", reply_markup=admin_kb(), parse_mode="HTML")
+
+# ==================== АДМИН: ЗВЁЗДЫ И ПРОДАЖИ ====================
+STARS_HOLD_SEC = 21 * 24 * 3600   # Telegram отдаёт звёзды на вывод только через 21 день после получения
+STARS_WITHDRAW_MIN = 1000         # минимум для вывода
+
+async def get_bot_star_balance():
+    """Баланс звёзд бота в Telegram (Bot API getMyStarBalance). None, если получить не удалось."""
+    try:
+        async with get_session().post(f"https://api.telegram.org/bot{BOT_TOKEN}/getMyStarBalance") as r:
+            data = await r.json()
+        if data.get("ok"):
+            return int(data["result"].get("amount", 0))
+        logging.error(f"getMyStarBalance: {data}")
+    except Exception as e:
+        logging.error(f"getMyStarBalance error: {e}")
+    return None
+
+def sales_stats() -> dict:
+    """Счётчики из локальной базы бота. Считает только платежи, которые бот сам записал."""
+    old = int(time.time()) - STARS_HOLD_SEC
+    m = _sql("SELECT COUNT(*), COUNT(DISTINCT tg_id), COALESCE(SUM(stars),0), COALESCE(SUM(amount),0) "
+             "FROM money_payments", fetch="one") or (0, 0, 0, 0)
+    m_old = _sql("SELECT COALESCE(SUM(stars),0) FROM money_payments WHERE created_at <= ?",
+                 (old,), fetch="one")[0]
+    v = _sql("SELECT COUNT(*), COUNT(DISTINCT user_id) FROM payments "
+             "WHERE status='paid' AND method='stars'", fetch="one") or (0, 0)
+    v_old = _sql("SELECT COUNT(*) FROM payments WHERE status='paid' AND method='stars' AND created_at <= ?",
+                 (old,), fetch="one")[0]
+    v_other = _sql("SELECT COUNT(*) FROM payments WHERE status='paid' AND method!='stars'",
+                   fetch="one")[0]
+    return {
+        "money_n": m[0], "money_buyers": m[1], "money_stars": m[2], "money_sold": m[3],
+        "verify_n": v[0], "verify_buyers": v[1], "verify_stars": v[0] * STARS_PRICE,
+        "verify_other": v_other,
+        "stars_total": m[2] + v[0] * STARS_PRICE,
+        "stars_old": m_old + v_old * STARS_PRICE,
+    }
+
+async def gift_stats():
+    """(сколько подарков куплено всего, сколько разных людей купило с момента подсчёта)."""
+    minted = await fb_get("gift_minted")
+    total = sum(_int(x) for x in minted.values()) if isinstance(minted, dict) else 0
+    buyers = await fb_get("stats_gift_buyers")
+    return total, (len(buyers) if isinstance(buyers, dict) else 0)
+
+def render_sales_text(s: dict, bal, gifts_total: int, gifts_buyers: int) -> str:
+    bal_txt = f"<b>{bal} ⭐</b>" if bal is not None else "не удалось получить"
+    return (
+        "⭐ <b>Звёзды и продажи</b>\n\n"
+        f"💰 Баланс звёзд бота в Telegram: {bal_txt}\n"
+        f"📈 Всего получено звёзд (по записям бота): <b>{s['stars_total']} ⭐</b>\n"
+        f"🔓 Из них получено 21+ дней назад: <b>{s['stars_old']} ⭐</b>\n\n"
+        "💎 <b>Swifty Money</b>\n"
+        f"Покупок: <b>{s['money_n']}</b>, людей: <b>{s['money_buyers']}</b>\n"
+        f"Звёзд: <b>{s['money_stars']} ⭐</b>, продано валюты: <b>{s['money_sold']}</b>\n\n"
+        "✅ <b>Подписки (галочки)</b>\n"
+        f"За звёзды: <b>{s['verify_n']}</b> шт. ({s['verify_stars']} ⭐), людей: <b>{s['verify_buyers']}</b>\n"
+        f"Через CryptoBot: <b>{s['verify_other']}</b>\n\n"
+        "🎁 <b>Подарки</b>\n"
+        f"Куплено подарков всего: <b>{gifts_total}</b>\n"
+        f"Людей, купивших подарок (с этого обновления): <b>{gifts_buyers}</b>\n\n"
+        "ℹ️ Подарки покупаются за Swifty Money, поэтому звёзды приходят только за валюту и галочки."
+    )
+
+@dp.callback_query(F.data == "admin_sales")
+async def admin_sales(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.answer()
+    s = sales_stats()
+    bal = await get_bot_star_balance()
+    try:
+        gifts_total, gifts_buyers = await gift_stats()
+    except Exception as e:
+        logging.error(f"gift_stats error: {e}")
+        gifts_total, gifts_buyers = 0, 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_sales")],
+        [InlineKeyboardButton(text="💸 Как вывести звёзды", callback_data="admin_withdraw")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
+    ])
+    try:
+        await call.message.edit_text(render_sales_text(s, bal, gifts_total, gifts_buyers),
+                                     reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass   # текст не изменился
+
+@dp.callback_query(F.data == "admin_withdraw")
+async def admin_withdraw(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.answer()
+    bal = await get_bot_star_balance()
+    bal_txt = f"{bal} ⭐" if bal is not None else "не удалось получить"
+    text = (
+        "💸 <b>Вывод звёзд</b>\n\n"
+        "Бот не может вывести звёзды сам: Telegram разрешает это только владельцу бота, "
+        "из его аккаунта и с двухэтапной проверкой (2FA).\n\n"
+        f"Сейчас на балансе бота: <b>{bal_txt}</b>\n"
+        f"Минимум для вывода: <b>{STARS_WITHDRAW_MIN} ⭐</b>, и только звёзды, полученные 21+ дней назад.\n\n"
+        "Как вывести:\n"
+        "1. С аккаунта-владельца бота откройте профиль бота в Telegram.\n"
+        "2. Раздел <b>Stars</b> → кнопка вывода (Withdraw).\n"
+        "3. Подтвердите на Fragment и введите пароль 2FA. Звёзды конвертируются в TON.\n\n"
+        "Если раздела Stars или вывода нет, он может быть недоступен для вашего аккаунта или региона."
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Звёзды и продажи", callback_data="admin_sales")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
+        ]))
+    except Exception:
+        pass
 
 @dp.callback_query(F.data == "profile")
 async def show_profile(call: CallbackQuery):
