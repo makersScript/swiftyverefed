@@ -940,6 +940,12 @@ async def username_blocker(name: str, uid: str):
             return who
     return None
 
+async def hide_nft_from_profile(upd: dict, name: str, uid: str):
+    """Пока имя на продаже, оно не может быть в профиле: added=False и убираем ссылку @имя -> uid."""
+    upd[f"nft_usernames/{name}/added"] = False
+    if (await fb_get(f"user_usernames/{name}")) == uid:
+        upd[f"user_usernames/{name}"] = None
+
 async def h_list_username(fb_uid, uid, req):
     name = str(req.get("name", "")).strip().lstrip("@").lower()
     price = _price_arg(req, MIN_USERNAME_PRICE)
@@ -952,7 +958,9 @@ async def h_list_username(fb_uid, uid, req):
         if isinstance(rec, dict):
             if rec.get("owner") != uid:
                 return {"ok": False, "code": "taken", "by": "nft"}
-            await fb_patch("", {f"nft_usernames/{name}/price": price, f"nft_usernames/{name}/ts": SERVER_TS})
+            upd = {f"nft_usernames/{name}/price": price, f"nft_usernames/{name}/ts": SERVER_TS}
+            await hide_nft_from_profile(upd, name, uid)
+            await fb_patch("", upd)
             return {"ok": True, "code": "listed"}
         blocker = await username_blocker(name, uid)
         if blocker:
@@ -976,7 +984,13 @@ async def h_unlist_username(fb_uid, uid, req):
         rec = await fb_get(f"nft_usernames/{name}")
         if not isinstance(rec, dict) or rec.get("owner") != uid:
             return {"ok": False, "code": "not_owner"}
-        await fb_patch("", {f"nft_usernames/{name}/price": 0})
+        if _int(rec.get("price")) < 1:
+            return {"ok": False, "code": "not_listed"}
+        # снять с продажи = отказаться от имени: оно удаляется и становится свободным для всех
+        upd = {f"nft_usernames/{name}": None}
+        if (await fb_get(f"user_usernames/{name}")) == uid:
+            upd[f"user_usernames/{name}"] = None
+        await fb_patch("", upd)
     return {"ok": True, "code": "unlisted"}
 
 async def h_release_username(fb_uid, uid, req):
